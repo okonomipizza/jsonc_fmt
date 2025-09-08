@@ -2,12 +2,87 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const jsonpico = @import("jsonpico");
-const Parser = jsonpico.JsonParser;
+const JsonParser = jsonpico.JsonParser;
 const JsonValue = jsonpico.JsonValue;
 
+const clap = @import("clap");
+
 pub fn main() !void {
-    // Prints to stderr, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    var stdout = std.fs.File.stdout();
+    var stdout_writer = stdout.writerStreaming(&.{});
+    var stderr = std.fs.File.stderr();
+    var stderr_writer = stderr.writerStreaming(&.{});
+
+    // CLI config
+    const params = comptime clap.parseParamsComptime(
+        \\-h, --help            Display this help and exit.
+        \\-v, --version         Output version information and exit.
+    );
+    var diag = clap.Diagnostic{};
+
+    // Parse command-line args
+    var res = clap.parse(clap.Help, &params, clap.parsers.default, .{
+        .diagnostic = &diag,
+        .allocator = a,
+    }) catch |err| {
+        try diag.reportToFile(.stderr(), err);
+        return err;
+    };
+    defer res.deinit();
+
+    if (res.args.help != 0)
+        return clap.helpToFile(.stderr(), clap.Help, &params, .{});
+    if (res.args.version != 0) {
+        const version_info =
+        \\ jsonc_fmt v0.1.0
+        \\ A JSON with Comments formatter written in Zig
+        ;
+        return try stdout_writer.interface.writeAll(version_info);
+    }
+
+    var stdin = std.fs.File.stdin();
+    // Buffer to read input
+    var buffer: [4096]u8 = undefined;
+    var input = try std.ArrayList(u8).initCapacity(a, 4096);
+    defer input.deinit(a);
+
+    while (true) {
+        const bytes_read = try stdin.read(buffer[0..]);
+        if (bytes_read == 0) break;
+        try input.appendSlice(a, buffer[0..bytes_read]);
+    }
+
+    var parser = JsonParser.init(a, input.items) catch |err| {
+        try stderr_writer.interface.print("JSON Parser initialization error: {}\n", .{err});
+        std.process.exit(1);
+    };
+    defer parser.deinit(a);
+
+    var parsed = parser.parse(a) catch |err| {
+        try stderr_writer.interface.print("Failed to parse JSON: {}\n", .{err});
+        return;
+    };
+    defer parsed.deinit(a);
+
+    var formatted_string = try std.ArrayList(u8).initCapacity(a, input.items.len);
+    defer formatted_string.deinit(a);
+
+    const writer = formatted_string.writer(a);
+
+    var formatter = Formatter.init(a, input.items, parser.positions, parser.comment_ranges);
+    defer formatter.deinit();
+
+    formatter.format(a, parsed, writer) catch |err| {
+        try stderr_writer.interface.print("Failed to format JSON: {}\n", .{err});
+        return;
+    };
+    try writer.writeByte('\n');
+
+    try stdout_writer.interface.writeAll(formatted_string.items);
 }
 
 const CommentType = enum {
@@ -20,8 +95,7 @@ const Comment = struct {
     content: []const u8,
 };
 
-
-const FormatError = error {
+const FormatError = error{
     NoOffset,
     InvalidObject,
     OutOfMemory,
@@ -33,16 +107,16 @@ const Formatter = struct {
     position: usize,
     positions: jsonpico.PositionMap,
     comment_ranges: jsonpico.CommentRanges,
+    used_comments: std.AutoHashMap(usize, bool),
     indent: usize, // indent levels
     indent_size: usize, // width of a indent
-    diff: usize, // difference of position between input and result
 
-    pub fn init(input: []const u8, positions: jsonpico.PositionMap, comment_ranges: jsonpico.CommentRanges) Formatter {
-        return .{
-            .input = input, 
-            .position = 0,
-            .positions = positions,
-            .comment_ranges = comment_ranges, .indent = 0, .indent_size = 4, .diff = 0 };
+    pub fn init(a: Allocator, input: []const u8, positions: jsonpico.PositionMap, comment_ranges: jsonpico.CommentRanges) Formatter {
+        return .{ .input = input, .position = 0, .positions = positions, .comment_ranges = comment_ranges, .used_comments = std.AutoHashMap(usize, bool).init(a),.indent = 0, .indent_size = 4 };
+    }
+
+    pub fn deinit(self: *Formatter) void {
+        self.used_comments.deinit();
     }
 
     pub fn format(self: *Formatter, a: Allocator, v: JsonValue, w: anytype) FormatError!void {
@@ -103,8 +177,7 @@ const Formatter = struct {
                         try w.print("/* {s} */\n", .{com});
                         a.free(com);
                         try self.writeIndent(w);
-                    }
-
+                    },
                 }
             }
 
@@ -115,7 +188,7 @@ const Formatter = struct {
             if (!is_last) {
                 try w.writeByte(',');
             }
-            
+
             // Write trailing comment
             const trailing_comment: ?Comment = try self.trailingComment(value);
             if (trailing_comment) |c| {
@@ -125,7 +198,7 @@ const Formatter = struct {
                     },
                     .block => {
                         try w.print(" /* {s} */\n", .{c.content});
-                    }
+                    },
                 }
             } else {
                 try newline(w);
@@ -142,7 +215,7 @@ const Formatter = struct {
 
         const lastline_range = self.getLastLineRange(value_range.start);
         if (lastline_range) |range| {
-            const lastline = self.input[range.start..range.end + 1]; 
+            const lastline = self.input[range.start .. range.end + 1];
             if (std.mem.indexOf(u8, lastline, "//")) |_| {
                 return self.searchComment(range.start, range.end);
             }
@@ -154,7 +227,7 @@ const Formatter = struct {
                 var i = range.start;
                 while (i >= 0) {
                     const maybe_first_line_range = self.getLastLineRange(i).?;
-                    const maybe_first_line = self.input[maybe_first_line_range.start..maybe_first_line_range.end + 1];
+                    const maybe_first_line = self.input[maybe_first_line_range.start .. maybe_first_line_range.end + 1];
                     if (std.mem.indexOf(u8, maybe_first_line, "/*")) |_| {
                         return self.searchComment(maybe_first_line_range.start, range.end);
                     }
@@ -163,7 +236,6 @@ const Formatter = struct {
                 }
                 return self.searchComment(range.start, range.end);
             }
-            
         }
 
         return null;
@@ -173,7 +245,7 @@ const Formatter = struct {
         var result = try std.ArrayList(u8).initCapacity(a, comment.len);
 
         var i: usize = 0;
-        while (i < comment.len): (i += 1) {
+        while (i < comment.len) : (i += 1) {
             const char = comment[i];
 
             if (char == '\n') {
@@ -182,7 +254,7 @@ const Formatter = struct {
                 while (i + 1 < comment.len and (comment[i + 1] == ' ' or comment[i + 1] == '\t')) {
                     i += 1;
                 }
-                
+
                 var remaining = self.indent * self.indent_size + 3; // +3 for "/* " prefix
                 while (remaining > 0) : (remaining -= 1) {
                     try result.append(a, ' ');
@@ -194,14 +266,14 @@ const Formatter = struct {
         return result.toOwnedSlice(a);
     }
 
-    fn getLastLineRange(self: *Formatter, curr: usize) ?struct {start: usize, end: usize} {
+    fn getLastLineRange(self: *Formatter, curr: usize) ?struct { start: usize, end: usize } {
         var lastline_start: usize = curr;
         var lastline_end: usize = curr;
 
         var i: usize = curr;
         var lastline_found = false;
-        
-        while (i >= 0): (i -= 1) {
+
+        while (i >= 0) : (i -= 1) {
             if (self.input[i] == '\n') {
                 if (!lastline_found) {
                     lastline_found = true;
@@ -216,11 +288,11 @@ const Formatter = struct {
         }
 
         if (lastline_start > lastline_end) lastline_start = 0;
-        
+
         if (!lastline_found) return null; // There is no previous line
-        
+
         if (lastline_start >= 0 and lastline_end < self.input.len) {
-            return .{.start = lastline_start, .end = lastline_end};
+            return .{ .start = lastline_start, .end = lastline_end };
         }
         return null;
     }
@@ -229,7 +301,7 @@ const Formatter = struct {
         const value_range = self.positions.get(v.getId()) orelse return FormatError.NoOffset;
         const eol = blk: {
             var i: usize = value_range.end;
-            while (i < self.input.len): (i+=1) {
+            while (i < self.input.len) : (i += 1) {
                 if (self.input[i] == '\n') {
                     break :blk i;
                 }
@@ -240,10 +312,18 @@ const Formatter = struct {
     }
 
     /// Returns if there is a comment between start and end
-    fn searchComment(self: Formatter, from: usize, until: usize) FormatError!?Comment {
+    fn searchComment(self: *Formatter, from: usize, until: usize) FormatError!?Comment {
         for (self.comment_ranges.items) |range| {
             if (range.start >= from and range.end <= until) {
-                return try self.parseComment(range.start, range.end);
+                if (self.used_comments.get(range.start)) |_| {
+                    continue;
+                }
+
+                const comment = try self.parseComment(range.start, range.end);
+
+                try self.used_comments.put(range.start, true);
+
+                return comment;
             }
         }
         return null;
@@ -251,9 +331,9 @@ const Formatter = struct {
 
     /// Generate Comment from commet range
     fn parseComment(self: Formatter, start: usize, end: usize) FormatError!Comment {
-        const comment_value = std.mem.trim(u8, self.input[start..end + 1], " \t");
+        const comment_value = std.mem.trim(u8, self.input[start .. end + 1], " \t");
         var i = start;
-        while (i >= 0): (i -= 1) {
+        while (i >= 0) : (i -= 1) {
             const char = self.input[i];
             if (char == '/') {
                 const prev = self.input[i - 1];
@@ -276,7 +356,7 @@ const Formatter = struct {
 
         self.position += 1; // Next to start '"'
 
-        while (self.position < self.input.len): (self.position += 1) {
+        while (self.position < self.input.len) : (self.position += 1) {
             const char = self.getChar(self.position) orelse break;
             if (char == '"') {
                 end = self.position;
@@ -285,7 +365,7 @@ const Formatter = struct {
             }
         }
 
-        return self.input[start..end + 1];
+        return self.input[start .. end + 1];
     }
 
     fn writeIndent(self: *Formatter, writer: anytype) !void {
@@ -315,7 +395,7 @@ const testing = std.testing;
 test "format object with a trailing comment" {
     const a = testing.allocator;
 
-    const input = 
+    const input =
         \\{ "key" : "value"/*  Inline comment   */
         \\
         \\}
@@ -326,7 +406,7 @@ test "format object with a trailing comment" {
         \\}
     ;
 
-    var parser = try Parser.init(a, input);
+    var parser = try JsonParser.init(a, input);
     defer parser.deinit(a);
 
     var parsed = try parser.parse(a);
@@ -337,7 +417,8 @@ test "format object with a trailing comment" {
 
     const writer = formatted_string.writer(a);
 
-    var formatter = Formatter.init(input, parser.positions, parser.comment_ranges);
+    var formatter = Formatter.init(a, input, parser.positions, parser.comment_ranges);
+    defer formatter.deinit();
 
     try formatter.format(a, parsed, writer);
 
@@ -347,7 +428,7 @@ test "format object with a trailing comment" {
 test "format object with a leading comment" {
     const a = testing.allocator;
 
-    const input = 
+    const input =
         \\{
         \\      /* Leading comment*/
         \\   "key" : "value"
@@ -361,7 +442,7 @@ test "format object with a leading comment" {
         \\}
     ;
 
-    var parser = try Parser.init(a, input);
+    var parser = try JsonParser.init(a, input);
     defer parser.deinit(a);
 
     var parsed = try parser.parse(a);
@@ -372,7 +453,8 @@ test "format object with a leading comment" {
 
     const writer = formatted_string.writer(a);
 
-    var formatter = Formatter.init(input, parser.positions, parser.comment_ranges);
+    var formatter = Formatter.init(a, input, parser.positions, parser.comment_ranges);
+    defer formatter.deinit();
 
     try formatter.format(a, parsed, writer);
 
@@ -382,7 +464,7 @@ test "format object with a leading comment" {
 test "format object has array value with a leading comment" {
     const a = testing.allocator;
 
-    const input = 
+    const input =
         \\{
         \\      /* Leading comment*/
         \\  "lang": "English",
@@ -397,7 +479,7 @@ test "format object has array value with a leading comment" {
         \\}
     ;
 
-    var parser = try Parser.init(a, input);
+    var parser = try JsonParser.init(a, input);
     defer parser.deinit(a);
 
     var parsed = try parser.parse(a);
@@ -408,7 +490,8 @@ test "format object has array value with a leading comment" {
 
     const writer = formatted_string.writer(a);
 
-    var formatter = Formatter.init(input, parser.positions, parser.comment_ranges);
+    var formatter = Formatter.init(a, input, parser.positions, parser.comment_ranges);
+    defer formatter.deinit();
 
     try formatter.format(a, parsed, writer);
 
@@ -418,19 +501,18 @@ test "format object has array value with a leading comment" {
 test "format" {
     const a = testing.allocator;
 
-    const input = 
+    const input =
         \\{
         \\    "game": "puzzle",
         \\  /* user configurable options
         \\  sound and difficulty */ 
-        \\      "options": {
-        \\          "sound":   true,
+        \\      "options": {"sound":   true,
         \\        "difficulty": 3     // max difficulty is 10
         \\  },
         \\
         \\    "powerups": ["speed" , "shield",   ]
         \\}
-        ;
+    ;
 
     const expected =
         \\{
@@ -443,9 +525,9 @@ test "format" {
         \\    },
         \\    "powerups": ["speed", "shield"]
         \\}
-        ;
+    ;
 
-    var parser = try Parser.init(a, input);
+    var parser = try JsonParser.init(a, input);
     defer parser.deinit(a);
 
     var parsed = try parser.parse(a);
@@ -456,12 +538,10 @@ test "format" {
 
     const writer = formatted_string.writer(a);
 
-    var formatter = Formatter.init(input, parser.positions, parser.comment_ranges);
+    var formatter = Formatter.init(a, input, parser.positions, parser.comment_ranges);
+    defer formatter.deinit();
 
     try formatter.format(a, parsed, writer);
 
     try testing.expectEqualStrings(expected, formatted_string.items);
 }
-
-
-

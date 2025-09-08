@@ -1,0 +1,8 @@
+{"game": "puzzle",
+ /* user configurable options
+ sound and difficulty */
+"options": {"sound": true,
+        "difficulty": 3         // max difficulty is 10
+    },
+"powerups": [   "speed", "shield"]
+}
