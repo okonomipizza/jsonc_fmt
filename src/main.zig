@@ -48,6 +48,7 @@ pub fn main() !void {
         const version_info =
         \\ jsonc_fmt v0.1.0
         \\ A JSON with Comments formatter written in Zig
+        \\
         ;
         return try stdout_writer.interface.writeAll(version_info);
     }
