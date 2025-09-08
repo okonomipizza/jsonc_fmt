@@ -34,8 +34,16 @@ pub fn main() !void {
     };
     defer res.deinit();
 
-    if (res.args.help != 0)
-        return clap.helpToFile(.stderr(), clap.Help, &params, .{});
+    if (res.args.help != 0) {
+        const help_info =
+        \\ USAGE
+        \\   echo '{"key": "value"}' | jsonc_fmt
+        \\ FLAGS
+        \\   -h, --help     Show help
+        \\   -v, --version  Show jsonc_fmt version
+        ;
+        return try stdout_writer.interface.writeAll(help_info);
+    }
     if (res.args.version != 0) {
         const version_info =
         \\ jsonc_fmt v0.1.0
