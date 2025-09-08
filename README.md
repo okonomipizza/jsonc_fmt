@@ -1,6 +1,6 @@
 # jsonc_fmt
 
-A command-line formatter for JSON with Comments (JSONC) files.
+A command-line formatter for JSON with Comments (JSONC) text.
 
 ## Overview
 
@@ -34,7 +34,7 @@ $ cat example.jsonc
 ```
 
 Format the file:
-'''console
+```console
 $ cat example.jsonc | jsonc_fmt
 {
     "game": "puzzle",
@@ -46,7 +46,7 @@ $ cat example.jsonc | jsonc_fmt
     },
     "powerups": ["speed", "shield"]
 }
-'''
+```
 
 ## Installation
 
